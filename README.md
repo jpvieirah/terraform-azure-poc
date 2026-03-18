@@ -260,6 +260,65 @@ gh api --method PUT repos/<seu-usuario>/<seu-repo>/environments/<novo-env>
 
 ---
 
+## Estratégia de Aprovação e Code Review
+
+### Visão ideal (com GitHub Team ou repo público)
+
+A arquitetura foi desenhada para funcionar com **environment protection rules** do GitHub, onde cada ambiente tem seus aprovadores:
+
+| Ambiente | Aprovadores | Regra |
+|----------|-------------|-------|
+| **prd** | `jpvieirah` + `Francinilo` | Ambos precisam aprovar para o apply executar |
+| **nprd** | `jpvieirah` | Apenas o owner aprova |
+| **lzone** | `jpvieirah` | Apenas o owner aprova |
+
+Nesse cenário, o fluxo seria:
+
+1. Dev faz push com alterações no Terraform
+2. Pipeline roda automaticamente o **plan** (init → fmt → validate → trivy → plan)
+3. Resultados ficam visíveis no **Job Summary** e **Artifacts**
+4. Dev dispara o apply via `workflow_dispatch` com `apply=true`
+5. O GitHub **pausa o job de apply** e solicita aprovação dos reviewers configurados no environment
+6. Aprovadores revisam o plan no Summary, aprovam ou rejeitam
+7. Só após aprovação, o apply executa
+
+Isso garante que **nenhuma mudança de infra vai para produção sem revisão**, mesmo que alguém tenha permissão de dispatch.
+
+### Implementação atual (POC — conta pessoal)
+
+Como esta POC usa um repo **privado em conta pessoal** (GitHub Free/Pro), o GitHub não suporta environment protection rules. Por isso, a governança é feita de forma manual:
+
+1. **Push** ou **dispatch com `apply=false`** → roda apenas o plan
+2. O responsável revisa o plan no Summary (output do Terraform + findings do Trivy)
+3. Se estiver ok, **dispara manualmente** com `apply=true` → aí roda plan + apply
+
+O gate de segurança é **quem tem permissão de dispatch no repo**. Como o repo é privado, apenas collaborators podem disparar.
+
+### Por que separar plan e apply em dispatch?
+
+A separação existe porque:
+
+- **Plan é seguro** — não altera nada, apenas mostra o que será feito
+- **Apply é destrutivo** — altera infra real e deve ser uma ação consciente
+- O **boolean `apply`** no dispatch força o usuário a deliberadamente optar por aplicar
+- Em ambiente corporativo com GitHub Team, esse dispatch com `apply=true` é o **gatilho** que aciona os environment protection rules (required reviewers)
+
+### Migração para ambiente corporativo
+
+Para usar essa pipeline em uma organização com aprovação real:
+
+1. Mova o repo para uma **org com plano GitHub Team** ($4/user/mês)
+2. Configure **required reviewers** em cada environment:
+   ```bash
+   # Exemplo: PRD com 2 aprovadores
+   printf '{"reviewers":[{"type":"User","id":ID_USER_1},{"type":"User","id":ID_USER_2}]}' | \
+     gh api repos/ORG/REPO/environments/prd --method PUT --input -
+   ```
+3. O workflow **não precisa mudar** — o job de apply já tem `environment: ${{ inputs.environment }}`, que automaticamente aciona as protection rules
+4. Atualize as **federated credentials** no Azure para o novo repo/org
+
+---
+
 ## Pipeline — Detalhamento
 
 ### Job: Plan
