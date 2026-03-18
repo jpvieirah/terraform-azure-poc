@@ -1,0 +1,33 @@
+# Caller — Landing Zone Environment
+name: "Deploy — Landing Zone"
+
+on:
+  push:
+    paths: ["terraform/lzone/**"]
+    branches: [main]
+
+  pull_request:
+    paths: ["terraform/lzone/**"]
+    branches: [main]
+
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Run terraform apply after plan?"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  deploy:
+    uses: ./.github/workflows/terraform-deploy.yml
+    with:
+      environment: lzone
+      terraform_dir: terraform/lzone
+      apply: ${{ github.event.inputs.apply == 'true' || false }}
+    secrets: inherit
