@@ -141,7 +141,11 @@ jobs:
             echo "|------|-------|"
             echo "| **Ambiente** | \`$ENV_NAME\` |"
             echo "| **Diretório** | \`$TF_DIR\` |"
-            echo "| **Plan Exit Code** | \`$PLAN_EXIT\` (0=no changes, 2=changes pending) |"
+            echo "| **Plan Exit Code** | \`$PLAN_EXIT\` (0=no changes, 1=error, 2=changes pending) |"
+            if [ "$PLAN_EXIT" = "1" ]; then
+              echo ""
+              echo "> ⛔ **Plan falhou (exit code 1). O apply será bloqueado automaticamente.**"
+            fi
             echo "| **Trivy Critical** | $TRIVY_CRITS |"
             echo "| **Trivy High** | $TRIVY_HIGHS |"
             echo ""
@@ -192,7 +196,7 @@ jobs:
   apply:
     name: "🚀 Apply — ${{ inputs.environment }}"
     needs: plan
-    if: inputs.apply == true
+    if: inputs.apply == true && needs.plan.outputs.plan_exit_code != '1'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     environment: ${{ inputs.environment }}
