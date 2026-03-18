@@ -4,7 +4,7 @@
 # Genérico: não conhece a infra, apenas mantém governança.
 # Recebe environment + terraform_dir do caller.
 #
-# Job 1: plan  → init, fmt, validate, plan, trivy, summary, artifacts
+# Job 1: plan  → init, fmt, validate, trivy, plan, summary, artifacts
 # Job 2: apply → environment gate (dispatch approval), apply, summary
 # ══════════════════════════════════════════════════════════════════════
 name: "Terraform Deploy (Reusable)"
@@ -45,7 +45,7 @@ env:
 
 jobs:
   # ════════════════════════════════════════════════════════════════════
-  # PLAN: init → fmt → validate → plan → trivy → summary → artifacts
+  # PLAN: init → fmt → validate → trivy → plan → summary → artifacts
   # ════════════════════════════════════════════════════════════════════
   plan:
     name: "📋 Plan — ${{ inputs.environment }}"
@@ -90,15 +90,7 @@ jobs:
         working-directory: ${{ inputs.terraform_dir }}
         run: terraform validate
 
-      - name: Terraform Plan
-        id: plan
-        working-directory: ${{ inputs.terraform_dir }}
-        run: |
-          terraform plan -no-color -out=tfplan -detailed-exitcode 2>&1 | tee plan.txt
-          echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
-        continue-on-error: true
-
-      # ── Security Scan (Trivy) ─────────────────────────────────────
+      # ── Security Scan (Trivy) — antes do plan ──────────────────────
       - name: "🔒 Trivy — IaC Security Scan"
         uses: aquasecurity/trivy-action@0.34.2
         with:
@@ -123,6 +115,14 @@ jobs:
             echo "highs=0" >> "$GITHUB_OUTPUT"
             echo "criticals=0" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ inputs.terraform_dir }}
+        run: |
+          terraform plan -no-color -out=tfplan -detailed-exitcode 2>&1 | tee plan.txt
+          echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
 
       # ── Job Summary ───────────────────────────────────────────────
       - name: "📊 Publish Job Summary"
