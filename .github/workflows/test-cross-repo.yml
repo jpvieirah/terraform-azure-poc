@@ -1,0 +1,8 @@
+name: "Test Cross-Repo"
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    uses: jpvieirah/digio-tf-workflows/.github/workflows/test-minimal.yml@main
+    with:
+      message: "Cross-repo call works!"
