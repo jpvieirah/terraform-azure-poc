@@ -19,6 +19,11 @@ on:
         type: boolean
         default: false
 
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
 jobs:
   deploy:
     uses: jpvieirah/digio-tf-workflows/.github/workflows/terraform-plan-apply.yml@main
