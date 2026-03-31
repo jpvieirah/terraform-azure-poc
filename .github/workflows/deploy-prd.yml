@@ -26,11 +26,9 @@ permissions:
 
 jobs:
   deploy:
-    uses: ./.github/workflows/terraform-plan-apply.yml
+    uses: ./.github/workflows/terraform-deploy.yml
     with:
       environment: prd
       terraform_dir: terraform/prd
-      backend_key: "prd.terraform.tfstate"
       apply: ${{ github.event.inputs.apply == 'true' || false }}
-      infracost_enabled: false
     secrets: inherit
