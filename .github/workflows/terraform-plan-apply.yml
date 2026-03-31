@@ -1,0 +1,397 @@
+# ══════════════════════════════════════════════════════════════════════
+# Reusable Workflow — Terraform Plan & Apply
+# ══════════════════════════════════════════════════════════════════════
+# Genérico: não conhece a infra, apenas mantém governança.
+# Callers usam:
+#   uses: jpvieirah/digio-tf-workflows/.github/workflows/terraform-plan-apply.yml@v1
+#
+# Job 1: plan  → init, fmt, validate, checkov, trivy, plan, infracost, summary, artifacts
+# Job 2: apply → environment gate (approval), apply, summary
+# ══════════════════════════════════════════════════════════════════════
+name: "Terraform Plan & Apply"
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Target environment (e.g. prd, nprd, dev)"
+        required: true
+        type: string
+      terraform_dir:
+        description: "Path to terraform root module (e.g. . or terraform/prd)"
+        required: false
+        type: string
+        default: "."
+      terraform_version:
+        description: "Terraform CLI version"
+        required: false
+        type: string
+        default: "1.14.7"
+      apply:
+        description: "Run terraform apply after plan"
+        required: false
+        type: boolean
+        default: false
+      backend_container:
+        description: "Azure Storage container for TF state"
+        required: false
+        type: string
+        default: "tfstate"
+      backend_key:
+        description: "State file key (e.g. sub-prod/workloads/app1.tfstate)"
+        required: true
+        type: string
+      checkov_enabled:
+        description: "Run Checkov policy scan"
+        required: false
+        type: boolean
+        default: true
+      infracost_enabled:
+        description: "Run Infracost cost estimation"
+        required: false
+        type: boolean
+        default: true
+      trivy_enabled:
+        description: "Run Trivy IaC security scan"
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════
+  # PLAN
+  # ════════════════════════════════════════════════════════════════════
+  plan:
+    name: "📋 Plan — ${{ inputs.environment }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TF_VERSION: ${{ inputs.terraform_version }}
+      ARM_USE_OIDC: true
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    outputs:
+      plan_exit_code: ${{ steps.plan.outputs.exitcode }}
+
+    steps:
+      # ── Setup ──────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # ── Terraform Core ─────────────────────────────────────────────
+      - name: Terraform Init
+        working-directory: ${{ inputs.terraform_dir }}
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ secrets.TF_STATE_RG }}" \
+            -backend-config="storage_account_name=${{ secrets.TF_STATE_SA }}" \
+            -backend-config="container_name=${{ inputs.backend_container }}" \
+            -backend-config="key=${{ inputs.backend_key }}" \
+            -backend-config="use_oidc=true"
+
+      - name: Terraform Format Check
+        working-directory: ${{ inputs.terraform_dir }}
+        run: terraform fmt -check -recursive -diff
+        continue-on-error: true
+
+      - name: Terraform Validate
+        working-directory: ${{ inputs.terraform_dir }}
+        run: terraform validate
+
+      # ── Checkov — Policy-as-Code ───────────────────────────────────
+      - name: "🛡️ Checkov — IaC Policy Scan"
+        if: inputs.checkov_enabled
+        id: checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: ${{ inputs.terraform_dir }}
+          framework: terraform
+          output_format: cli,json
+          output_file_path: console,checkov-results.json
+          soft_fail: true
+          quiet: true
+
+      # ── Trivy — Security Scan ──────────────────────────────────────
+      - name: "🔒 Trivy — IaC Security Scan"
+        if: inputs.trivy_enabled
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          scan-type: config
+          scan-ref: ${{ inputs.terraform_dir }}
+          format: json
+          output: trivy-results.json
+          severity: HIGH,CRITICAL
+          exit-code: 0
+        continue-on-error: true
+
+      - name: Parse Trivy Results
+        if: inputs.trivy_enabled
+        id: trivy
+        run: |
+          if [ -f trivy-results.json ]; then
+            HIGHS=$(jq '[.Results[]?.Misconfigurations[]? | select(.Severity=="HIGH")] | length' trivy-results.json 2>/dev/null || echo 0)
+            CRITS=$(jq '[.Results[]?.Misconfigurations[]? | select(.Severity=="CRITICAL")] | length' trivy-results.json 2>/dev/null || echo 0)
+            echo "highs=$HIGHS" >> "$GITHUB_OUTPUT"
+            echo "criticals=$CRITS" >> "$GITHUB_OUTPUT"
+            echo "Trivy: $CRITS critical, $HIGHS high"
+          else
+            echo "highs=0" >> "$GITHUB_OUTPUT"
+            echo "criticals=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Terraform Plan ─────────────────────────────────────────────
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ inputs.terraform_dir }}
+        run: |
+          terraform plan -no-color -out=tfplan -detailed-exitcode 2>&1 | tee plan.txt
+          echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+
+      # ── Infracost — Cost Estimation ────────────────────────────────
+      - name: "💰 Setup Infracost"
+        if: inputs.infracost_enabled
+        uses: infracost/actions/setup@v3
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: "💰 Infracost Breakdown"
+        if: inputs.infracost_enabled
+        working-directory: ${{ inputs.terraform_dir }}
+        run: |
+          infracost breakdown \
+            --path . \
+            --format json \
+            --out-file infracost.json 2>/dev/null || true
+
+      - name: "💰 Parse Infracost"
+        if: inputs.infracost_enabled
+        id: infracost
+        run: |
+          INFRA_FILE="${{ inputs.terraform_dir }}/infracost.json"
+          if [ -f "$INFRA_FILE" ]; then
+            MONTHLY=$(jq -r '.totalMonthlyCost // "N/A"' "$INFRA_FILE" 2>/dev/null || echo "N/A")
+            echo "monthly_cost=$MONTHLY" >> "$GITHUB_OUTPUT"
+          else
+            echo "monthly_cost=N/A" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Job Summary ────────────────────────────────────────────────
+      - name: "📊 Publish Job Summary"
+        if: always()
+        env:
+          ENV_NAME: ${{ inputs.environment }}
+          TF_DIR: ${{ inputs.terraform_dir }}
+          TRIVY_HIGHS: ${{ steps.trivy.outputs.highs || '0' }}
+          TRIVY_CRITS: ${{ steps.trivy.outputs.criticals || '0' }}
+          PLAN_EXIT: ${{ steps.plan.outputs.exitcode }}
+          MONTHLY_COST: ${{ steps.infracost.outputs.monthly_cost || 'N/A' }}
+        run: |
+          {
+            echo "# 🏗️ Terraform Plan — \`$ENV_NAME\`"
+            echo ""
+            echo "| Item | Value |"
+            echo "|------|-------|"
+            echo "| **Environment** | \`$ENV_NAME\` |"
+            echo "| **Directory** | \`$TF_DIR\` |"
+            echo "| **Plan Exit Code** | \`$PLAN_EXIT\` (0=no changes, 1=error, 2=changes pending) |"
+            echo "| **Trivy Critical** | $TRIVY_CRITS |"
+            echo "| **Trivy High** | $TRIVY_HIGHS |"
+            echo "| **Estimated Cost** | \$${MONTHLY_COST}/month |"
+
+            if [ "$PLAN_EXIT" = "1" ]; then
+              echo ""
+              echo "> ⛔ **Plan failed (exit code 1). Apply will be blocked automatically.**"
+            fi
+            echo ""
+
+            echo "## 📝 Terraform Plan Output"
+            echo ""
+            echo '```'
+            if [ -f "$TF_DIR/plan.txt" ]; then
+              tail -100 "$TF_DIR/plan.txt"
+            else
+              echo "No plan output found"
+            fi
+            echo '```'
+            echo ""
+
+            # Trivy findings
+            if [ -f trivy-results.json ]; then
+              FINDINGS=$(jq '[.Results[]?.Misconfigurations[]?] | length' trivy-results.json 2>/dev/null || echo 0)
+              if [ "$FINDINGS" -gt 0 ]; then
+                echo "## 🔒 Trivy Security Findings"
+                echo ""
+                echo "| Severity | ID | Title |"
+                echo "|----------|----|-------|"
+                jq -r '.Results[]?.Misconfigurations[]? | "| \(.Severity) | \(.ID) | \(.Title) |"' trivy-results.json 2>/dev/null | head -20
+                echo ""
+              fi
+            fi
+
+            # Checkov summary
+            if [ -f checkov-results.json ]; then
+              PASSED=$(jq '[.results?.passed_checks[]?] | length' checkov-results.json 2>/dev/null || echo 0)
+              FAILED=$(jq '[.results?.failed_checks[]?] | length' checkov-results.json 2>/dev/null || echo 0)
+              if [ "$FAILED" -gt 0 ] || [ "$PASSED" -gt 0 ]; then
+                echo "## 🛡️ Checkov Policy Summary"
+                echo ""
+                echo "| Passed | Failed |"
+                echo "|--------|--------|"
+                echo "| $PASSED | $FAILED |"
+                echo ""
+              fi
+            fi
+
+            echo "---"
+            echo "📎 Full plan and reports available in **Artifacts**."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ── PR Comment (plan + cost summary) ───────────────────────────
+      - name: "💬 PR Comment"
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          PLAN_EXIT: ${{ steps.plan.outputs.exitcode }}
+          MONTHLY_COST: ${{ steps.infracost.outputs.monthly_cost || 'N/A' }}
+          ENV_NAME: ${{ inputs.environment }}
+          TRIVY_CRITS: ${{ steps.trivy.outputs.criticals || '0' }}
+          TRIVY_HIGHS: ${{ steps.trivy.outputs.highs || '0' }}
+        with:
+          script: |
+            const fs = require('fs');
+            const tfDir = '${{ inputs.terraform_dir }}';
+            let planOutput = 'No plan output found';
+            try {
+              const raw = fs.readFileSync(`${tfDir}/plan.txt`, 'utf8');
+              planOutput = raw.length > 4000 ? '...\n' + raw.slice(-4000) : raw;
+            } catch {}
+
+            const body = [
+              `### 🏗️ Terraform Plan — \`${process.env.ENV_NAME}\``,
+              '',
+              `| Item | Value |`,
+              `|------|-------|`,
+              `| Plan Exit Code | \`${process.env.PLAN_EXIT}\` |`,
+              `| Trivy Critical | ${process.env.TRIVY_CRITS} |`,
+              `| Trivy High | ${process.env.TRIVY_HIGHS} |`,
+              `| Estimated Cost | \$${process.env.MONTHLY_COST}/month |`,
+              '',
+              '<details><summary>Plan Output</summary>',
+              '',
+              '```',
+              planOutput,
+              '```',
+              '</details>',
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+      # ── Upload Artifacts ───────────────────────────────────────────
+      - name: Upload Plan Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ inputs.environment }}-${{ github.run_number }}
+          path: |
+            ${{ inputs.terraform_dir }}/tfplan
+            ${{ inputs.terraform_dir }}/plan.txt
+            ${{ inputs.terraform_dir }}/infracost.json
+            trivy-results.json
+            checkov-results.json
+          retention-days: 30
+          if-no-files-found: ignore
+
+  # ════════════════════════════════════════════════════════════════════
+  # APPLY
+  # ════════════════════════════════════════════════════════════════════
+  apply:
+    name: "🚀 Apply — ${{ inputs.environment }}"
+    needs: plan
+    if: inputs.apply == true && needs.plan.outputs.plan_exit_code != '1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: ${{ inputs.environment }}
+    env:
+      TF_VERSION: ${{ inputs.terraform_version }}
+      ARM_USE_OIDC: true
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform Init
+        working-directory: ${{ inputs.terraform_dir }}
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ secrets.TF_STATE_RG }}" \
+            -backend-config="storage_account_name=${{ secrets.TF_STATE_SA }}" \
+            -backend-config="container_name=${{ inputs.backend_container }}" \
+            -backend-config="key=${{ inputs.backend_key }}" \
+            -backend-config="use_oidc=true"
+
+      - name: Download Plan Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ inputs.environment }}-${{ github.run_number }}
+          path: artifacts/
+
+      - name: Restore Plan File
+        run: cp artifacts/tfplan ${{ inputs.terraform_dir }}/tfplan 2>/dev/null || true
+
+      - name: Terraform Apply
+        working-directory: ${{ inputs.terraform_dir }}
+        run: |
+          if [ -f tfplan ]; then
+            terraform apply -auto-approve tfplan
+          else
+            terraform apply -auto-approve
+          fi
+
+      - name: "✅ Post Apply Summary"
+        run: |
+          {
+            echo "## ✅ Terraform Apply — \`${{ inputs.environment }}\`"
+            echo ""
+            echo "Deploy realizado com sucesso no ambiente **${{ inputs.environment }}**."
+            echo ""
+            echo "| Item | Value |"
+            echo "|------|-------|"
+            echo "| **Commit** | \`${{ github.sha }}\` |"
+            echo "| **Triggered by** | ${{ github.actor }} |"
+            echo "| **Run** | [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |"
+          } >> "$GITHUB_STEP_SUMMARY"
